@@ -34,15 +34,22 @@ which Xvfb || echo "Xvfb missing"
 which fluxbox || echo "fluxbox missing"
 which x11vnc || echo "x11vnc missing"
 which websockify || echo "websockify missing"
+which chromium || echo "chromium (system) missing"
+which google-chrome || echo "google-chrome missing"
+which google-chrome-stable || echo "google-chrome-stable missing"
+
+echo "=== Debug: Testing Chrome Execution & Shared Libraries ==="
+google-chrome-stable --version 2>&1 || echo "Chrome version check failed"
+ldd /usr/bin/google-chrome-stable | grep "not found" || echo "All shared library dependencies satisfied"
 echo "=========================================="
 
 export DISPLAY=:0
 rm -f /tmp/.X0-lock
-setsid Xvfb :0 -screen 0 1280x800x24 >/tmp/xvfb.log 2>&1 &
+setsid Xvfb :0 -screen 0 1280x800x24 -ac +extension GLX +render -noreset >/tmp/xvfb.log 2>&1 &
 sleep 1
 setsid fluxbox >/tmp/fluxbox.log 2>&1 &
-sleep 1
-setsid x11vnc -display :0 -forever -shared -nopw -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
+sleep 2
+setsid x11vnc -display :0 -forever -shared -nopw -rfbport 5900 -noxrecord -noxfixes -noxdamage >/tmp/x11vnc.log 2>&1 &
 sleep 1
 setsid websockify --web /usr/share/novnc 0.0.0.0:6080 127.0.0.1:5900 >/tmp/websockify.log 2>&1 &
 sleep 1
@@ -51,27 +58,44 @@ sleep 1
     std::fs::write(&start_script_path, lf_content)
         .context("Failed to write start_command.sh")?;
 
-    // 1. 写入 Dockerfile
-    let dockerfile_content = r#"FROM e2bdev/desktop:latest
-USER root
-# 复制启动脚本并赋予执行权限
-COPY start_command.sh /start_command.sh
-RUN chmod +x /start_command.sh
-
-# 安装缺少的 VNC 窗口管理器和 noVNC 代理组件
-RUN apt-get update && apt-get install -y fluxbox websockify novnc
-
-# 直接使用已有的 python3 和 pip 安装 Playwright 及其浏览器依赖
-RUN pip install playwright && \
-    playwright install chromium && \
-    playwright install-deps chromium
-
-USER user
-"#;
+    // 写入 Dockerfile
+    // 策略：使用官方 deb 包安装 Google Chrome Stable（完整 GUI，原生 X11 支持，VNC 可见）
+    // 绕过 Debian 下 apt 直接装 chromium 不存在的问题，同时也避免了 playwright install 软连接失效问题。
+    let dockerfile_content = "FROM e2bdev/desktop:latest\n\
+USER root\n\
+\n\
+# 复制启动脚本\n\
+COPY start_command.sh /start_command.sh\n\
+RUN chmod +x /start_command.sh\n\
+\n\
+# 安装 VNC 桌面组件\n\
+RUN apt-get update && apt-get install -y --no-install-recommends fluxbox websockify novnc xterm wget gnupg && rm -rf /var/lib/apt/lists/*\n\
+\n\
+# CJK 字体（可选）\n\
+RUN apt-get update && apt-get install -y --no-install-recommends fonts-wqy-zenhei fonts-wqy-microhei 2>/dev/null; apt-get install -y --no-install-recommends fonts-noto-cjk 2>/dev/null; rm -rf /var/lib/apt/lists/*; true\n\
+\n\
+# 安装 Google Chrome 稳定版（含完整 GUI，支持 X11，VNC 中可见）\n\
+RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \\\n\
+&& echo \"deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main\" >> /etc/apt/sources.list.d/google.list \\\n\
+&& apt-get update \\\n\
+&& apt-get install -y --no-install-recommends google-chrome-stable \\\n\
+&& rm -rf /var/lib/apt/lists/*\n\
+\n\
+# 创建 chromium 软链接，使得支持 chromium 命令的工具能自动调用它\n\
+RUN ln -sf /usr/bin/google-chrome-stable /usr/local/bin/chromium \\\n\
+&& ln -sf /usr/bin/google-chrome-stable /usr/local/bin/google-chrome\n\
+\n\
+# 安装 Playwright Python 库（仅库本身，不下载 playwright 浏览器）\n\
+# 运行时由 PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH 指向 google-chrome-stable\n\
+RUN pip3 install playwright\n\
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/google-chrome-stable\n\
+\n\
+USER user\n\
+";
     std::fs::write(&dockerfile_path, dockerfile_content)
         .context("Failed to write Dockerfile")?;
 
-    on_log("环境准备完毕，开始调用 E2B CLI 构建镜像 (E2B 2.0 在云端构建，不需要本地安装 Docker)...\n".to_string());
+    on_log("Environment setup complete. Invoking E2B CLI to build the image (E2B 2.0 builds in the cloud; no local Docker installation is required)...\n".to_string());
     
     // 3. 执行 npx @e2b/cli template create
     // 在 Windows 下需要调用 npx.cmd
@@ -88,6 +112,10 @@ USER user
         .arg("/start_command.sh")
         .arg("--ready-cmd")
         .arg("python3 -c \"import socket; s = socket.socket(); s.connect(('127.0.0.1', 6080))\"")
+        .arg("--cpu-count")
+        .arg("2")
+        .arg("--memory-mb")
+        .arg("2048")
         .arg(name)
         .env("E2B_API_KEY", api_key)
         .current_dir(&builder_dir)
@@ -137,23 +165,15 @@ USER user
         anyhow::bail!("E2B template build failed with exit code: {}.\nError details:\n{}", status, full_output);
     }
 
-    on_log("构建成功！正在解析 Template ID...\n".to_string());
+    on_log("Build succeeded! Parsing Template ID...\n".to_string());
 
     // 解析出 template ID
-    let re = regex::Regex::new(r"(?i)\b(?:id|template_id)[:\s]+([a-z0-9]{20})\b").unwrap();
+    let re = regex::Regex::new(r"(?i)\b(?:id|template_id)[\s:]+([a-z0-9]{20})\b").unwrap();
     if let Some(cap) = re.captures(&full_output) {
         let id = cap.get(1).unwrap().as_str().to_string();
+        on_log(format!("Template ID successfully parsed: {}\n", id));
         return Ok(id);
     }
 
-    // 回退解析：寻找任何非 "dockerfile" 的 20 位字母数字组合作为 ID
-    let re_fallback = regex::Regex::new(r"\b([a-z0-9]{20})\b").unwrap();
-    for cap in re_fallback.captures_iter(&full_output) {
-        let matched = cap.get(1).unwrap().as_str();
-        if matched != "dockerfile" && matched != "template" {
-            return Ok(matched.to_string());
-        }
-    }
-
-    anyhow::bail!("构建成功，但未能从 E2B CLI 输出日志中提取出生成的 template_id")
+    anyhow::bail!("Template build succeeded, but failed to extract the generated templateID from E2B CLI logs")
 }

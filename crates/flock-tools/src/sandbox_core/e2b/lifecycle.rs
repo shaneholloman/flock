@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct E2BCreateSandboxRequest {
     #[serde(rename = "templateID")]
     pub template_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,12 +48,13 @@ pub async fn create_sandbox(cfg: &SandboxConfig) -> anyhow::Result<String> {
         .unwrap_or("")
         .trim();
     if template_id.is_empty() {
-        template_id = "jj17rl441iqdc6ea5mkb"; // 使用您发布的公共模版 ID 作为默认兜底
+        template_id = "aa5z6s0zm7qv5g3oay5v"; // 使用您发布的公共模版 ID 作为默认兜底
     }
 
     let client = reqwest::Client::new();
     let payload = E2BCreateSandboxRequest {
         template_id: template_id.to_string(),
+        timeout: Some(300),
     };
 
     crate::emit_info(&flock_core::tr(
